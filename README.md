@@ -1,64 +1,65 @@
 # Vélib' Data Pipeline
 
-Un pipeline de données de bout en bout sur un flux public en temps réel : la
-disponibilité des 1 526 stations Vélib' de la métropole parisienne. Ingestion
-continue, lac de données en couches, modèles analytiques testés, orchestration
-et supervision, avec les outils qu'on retrouve dans la plupart des plateformes
-data : Kafka, Spark, Delta Lake, dbt, Airflow, Prometheus et Grafana, plus
-l'équivalent AWS en Terraform.
+**Suivre en direct les 1 526 stations Vélib' de Paris et de sa métropole, avec les outils qu'utilisent les équipes data des grandes entreprises.**
 
-Toute la pile tourne en local avec Docker Compose (8 Go de RAM suffisent).
+Toutes les minutes, Vélib' publie l'état de chaque station : combien de vélos
+mécaniques, combien d'électriques, combien de places libres. Ce projet capte ce
+flux, le range, le nettoie, le transforme en indicateurs utiles (quelles
+stations sont souvent vides, quels arrondissements manquent de vélos) et
+surveille que tout fonctionne. Toute la chaîne tourne sur un seul ordinateur
+avec Docker, et son équivalent sur AWS est décrit en Terraform.
 
 ![Architecture](docs/architecture.svg)
 
-Le document complet est dans [docs/velib-data-pipeline.pdf](docs/velib-data-pipeline.pdf).
+## Le chemin d'une donnée
 
-## Le parcours de la donnée
+1. **Collecte.** Un petit programme Python interroge le flux Vélib' chaque
+   minute et ne transmet que les stations dont l'état a changé.
+2. **Transport.** **Kafka** reçoit ces messages et les garde sept jours : si
+   une étape plante, rien n'est perdu, on reprend où on en était.
+3. **Rangement.** **Spark** lit Kafka en continu et écrit dans un lac de
+   données au format **Delta Lake**, en deux couches :
+   - *bronze* : les messages bruts, tels qu'ils sont arrivés ;
+   - *silver* : des relevés propres, typés, sans doublons.
+4. **Indicateurs.** **dbt** transforme ces relevés en tables prêtes à
+   l'analyse : disponibilité par heure, stations saturées, état du réseau par
+   arrondissement. Chaque table est testée.
+5. **Orchestration.** **Airflow** lance tout ça chaque heure : il vérifie que
+   les données arrivent, exécute dbt, publie les indicateurs et en exporte une
+   copie.
+6. **Surveillance.** **Prometheus** et **Grafana** affichent le débit, les
+   erreurs, le retard éventuel et l'état du réseau.
 
-| Étape | Outil | Ce qui s'y passe |
-|---|---|---|
-| Collecte | Python | interroge le flux GBFS chaque minute, ne publie que les stations qui ont un nouveau relevé |
-| Transport | Kafka (KRaft) | un topic par flux, clé = station, producteur idempotent |
-| Bronze | Spark Structured Streaming, Delta Lake | chaque message brut avec sa position Kafka, partitionné par jour |
-| Silver | Spark, Delta `MERGE` | relevés typés et dédoublonnés, référentiel des stations à jour |
-| Gold | dbt + DuckDB | disponibilité par heure, stations saturées, état du réseau, par zone |
-| Orchestration | Airflow | contrôle de fraîcheur, `dbt build`, métriques, export Parquet |
-| Supervision | Prometheus, Pushgateway, Grafana | débit, erreurs de collecte, retard, état du réseau |
-| Stockage objet | Garage (API S3) | le lac ; remplaçable par S3 sans toucher au code |
+## Ce que le vrai flux m'a appris
 
-## Choix qui comptent
+Travailler sur une vraie source plutôt que sur des données inventées a fait
+apparaître des problèmes qu'aucune démo n'aurait montrés :
 
-- **Un seul écrivain par table Delta.** La compaction et le nettoyage sont
-  faits par le job Spark lui-même, pas par un second processus qui pourrait
-  entrer en conflit avec ses écritures.
-- **Idempotence à chaque étage.** Producteur Kafka idempotent, bronze en ajout
-  avec point de reprise, silver en `MERGE` sur (station, horodatage du relevé) :
-  rejouer un topic ne crée aucun doublon.
-- **Le lac ne dépend que de l'API S3.** En local, Garage ; sur AWS, S3. MinIO,
-  longtemps le choix par défaut, ne publie plus d'images ; la bascule n'a
-  touché que le bloc de stockage du `docker-compose.yml`.
-- **Des tests à chaque couche** : transformations Spark testées sans Kafka ni
-  S3, 23 tests dbt, DAG Airflow chargé en CI, `terraform validate`.
+- **Le serveur Vélib' refuse les programmes anonymes.** Il faut se présenter
+  avec un User-Agent, et en caractères ASCII : un accent dans le mien faisait
+  échouer chaque collecte.
+- **Le flux se répète.** Par moments, il renvoie un état plus ancien pour une
+  centaine de stations. Sur les 70 premières minutes : 5 794 messages pour
+  3 212 relevés réellement différents. La couche silver fait le tri.
+- **Certaines stations sont muettes.** 21 n'ont rien envoyé depuis plus d'une
+  semaine, une depuis 2021. Il faut les écarter des moyennes.
+- **Les codes de station cachent l'arrondissement**, mais les arrondissements
+  1 à 9 ont un code à 4 chiffres et non 5. Ma première règle rangeait tout le
+  centre de Paris en banlieue. Un test vérifie maintenant que les 20
+  arrondissements sont bien là.
+- **Le stockage n'est pas un détail.** MinIO, l'outil habituel pour un stockage
+  type S3 en local, ne publie plus ses images. J'ai d'abord essayé SeaweedFS,
+  incompatible avec Spark, puis adopté **Garage**. Le traitement n'a pas changé
+  d'une ligne : seul le bloc de stockage a bougé.
 
-## Ce que le vrai flux a appris
+Le dossier complet est dans [docs/velib-data-pipeline.pdf](docs/velib-data-pipeline.pdf).
 
-- Le serveur GBFS répond 403 à un client qui ne s'identifie pas : il faut un
-  User-Agent explicite, en ASCII (un accent le rendait invalide et faisait
-  échouer chaque collecte — un test le garde désormais).
-- Le flux renvoie par intermittence un instantané plus ancien pour une centaine
-  de stations. Le producteur ne peut pas le voir ; la couche silver
-  dédoublonne : sur les 70 premières minutes, 5 794 messages pour 3 212 relevés
-  uniques.
-- 21 stations n'ont rien émis depuis plus de 7 jours, l'une depuis 2021. Elles
-  restent dans le référentiel mais faussent les moyennes si on ne les filtre pas.
-- Avec Garage, le connecteur S3A de Hadoop doit garder ses marqueurs de
-  répertoire (`fs.s3a.directory.marker.retention=keep`) : sinon il réessaie
-  indéfiniment des suppressions que le serveur refuse.
+## L'essayer
 
-## Démarrage
+Il faut Docker et environ 8 Go de mémoire pour Docker.
 
 ```bash
-cp .env.example .env       # renseigner les secrets (voir les commentaires)
+cp .env.example .env       # les commentaires expliquent comment générer les secrets
 docker compose up -d --build
 ```
 
@@ -68,27 +69,37 @@ docker compose up -d --build
 | Grafana | http://localhost:3000 |
 | Kafka UI | `docker compose --profile debug up -d kafka-ui`, puis http://localhost:8081 |
 
-Les premières tables Delta apparaissent quelques minutes après le démarrage ;
-le DAG `velib_hourly` tourne à chaque heure.
+Les premières données apparaissent après quelques minutes ; Airflow tourne à
+chaque heure.
 
-## Structure
+## Quelques choix, expliqués
+
+- **Une seule écriture par table.** Seul Spark écrit dans le lac, y compris
+  pour l'entretien des fichiers. Deux programmes qui écrivent au même endroit
+  finissent par se gêner.
+- **Rejouer sans doublonner.** On peut relire tout Kafka depuis le début : la
+  couche silver ne gardera chaque relevé qu'une fois.
+- **Prêt pour le cloud.** En local, Garage remplace S3 ; Kafka, Spark et le
+  catalogue ont leurs équivalents AWS dans `infra/aws/` (S3, MSK, EMR, Glue).
+
+## Organisation du dépôt
 
 ```
-producer/        collecte GBFS -> Kafka (Python, confluent-kafka)
-spark/jobs/      Kafka -> bronze -> silver (Structured Streaming, Delta)
-dbt/             modèles staging et marts, tests
-airflow/dags/    DAG horaire et ses tâches
-monitoring/      Prometheus, tableau de bord Grafana provisionné
-infra/local/     configuration et initialisation de Garage
-infra/aws/       équivalent AWS : S3, MSK Serverless, EMR Serverless, Glue
+producer/       la collecte (Python)
+spark/          le traitement en continu
+dbt/            les indicateurs et leurs tests
+airflow/        l'orchestration
+monitoring/     Prometheus et le tableau de bord Grafana
+infra/          le stockage local (Garage) et la version AWS (Terraform)
 ```
 
 ## Tests
 
-La CI exécute cinq jobs indépendants : tests du producteur, tests Spark
-(PySpark local), `dbt build` sur un échantillon réel versionné, chargement des
-DAG Airflow, `terraform validate`.
+L'intégration continue vérifie chaque brique séparément : la collecte, les
+transformations Spark, les 23 tests dbt (sur un vrai échantillon du flux), le
+chargement des tâches Airflow et la configuration Terraform.
 
-## Licence
+---
 
-Code sous licence MIT. Données : Vélib' Métropole, flux GBFS en open data.
+Code sous licence MIT, par Sassi Benalouache ([Falakion](https://falakion.com)).
+Données : Vélib' Métropole, flux GBFS en open data.
