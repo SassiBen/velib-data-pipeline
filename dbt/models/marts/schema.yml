@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: dim_stations
+    columns:
+      - name: station_id
+        tests: [unique, not_null]
+      - name: zone
+        tests: [not_null]
+  - name: fct_station_hourly
+    columns:
+      - name: station_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_stations')
+                field: station_id
+              config:
+                severity: warn
+      - name: empty_ratio
+        tests: [not_null]
+  - name: mart_network_now
+    columns:
+      - name: station_id
+        tests: [unique, not_null]

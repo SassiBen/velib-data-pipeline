@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: stg_station_status
+    description: Relevés de disponibilité, un par station et par horodatage de relevé.
+    columns:
+      - name: station_id
+        tests: [not_null]
+      - name: bikes
+        tests: [not_null]
+      - name: reported_at
+        tests: [not_null]
+  - name: stg_stations
+    description: Référentiel des stations (dernière version connue).
+    columns:
+      - name: station_id
+        tests: [not_null, unique]

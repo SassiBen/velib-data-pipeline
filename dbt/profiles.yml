@@ -1,0 +1,18 @@
+velib:
+  target: lake
+  outputs:
+    lake:
+      type: duckdb
+      path: "{{ env_var('WAREHOUSE_PATH', '/data/warehouse/velib.duckdb') }}"
+      extensions: [httpfs, delta]
+      secrets:
+        - type: s3
+          key_id: "{{ env_var('S3_ACCESS_KEY') }}"
+          secret: "{{ env_var('S3_SECRET_KEY') }}"
+          endpoint: "{{ env_var('S3_ENDPOINT_HOST', 'garage:3900') }}"
+          url_style: path
+          use_ssl: false
+          region: "{{ env_var('S3_REGION', 'garage') }}"
+    ci:
+      type: duckdb
+      path: "target/ci.duckdb"
